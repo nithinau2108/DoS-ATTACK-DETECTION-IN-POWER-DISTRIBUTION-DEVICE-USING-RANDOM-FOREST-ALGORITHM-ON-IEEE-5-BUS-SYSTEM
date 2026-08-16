@@ -1,0 +1,168 @@
+%% =================================================================
+%  TIME-LAPSE (SEQUENTIAL) DATASET GENERATOR
+%  Each "event" is now a SEQUENCE of T timesteps, not a single
+%  snapshot - so Normal, Low/Medium/High DoS, and Recovery each have
+%  a genuine TEMPORAL signature (ramp-up, sustain, ramp-down).
+%  -----------------------------------------------------------------
+%  Output: DoS_timeseries_dataset.mat containing a cell array
+%  "sequences" (each T x numFeatures) and "seqLabels" (categorical,
+%  one label per SEQUENCE - the label describes the whole event).
+% ==================================================================
+
+clear; clc;
+
+baseMVA = 100; tol = 1e-8; maxIter = 50;
+busData = [1 1 1.06 0 0 0 0; 2 0 1.00 40 30 20 10; 3 0 1.00 0 0 45 15; ...
+           4 0 1.00 0 0 40 5; 5 0 1.00 0 0 60 10];
+lineData = [1 2 0.02 0.06 0.03; 1 3 0.08 0.24 0.025; 2 3 0.06 0.18 0.02; ...
+            2 4 0.06 0.18 0.02; 2 5 0.04 0.12 0.015; 3 4 0.01 0.03 0.01; ...
+            4 5 0.08 0.24 0.025];
+nbus = 5; slack = 1; pq = 2:5;
+Ybus0 = buildYbus(nbus, lineData); G0 = real(Ybus0); B0 = imag(Ybus0);
+Pspec0 = (busData(:,4)-busData(:,6))/baseMVA;
+Qspec0 = (busData(:,5)-busData(:,7))/baseMVA;
+
+classNames = {'Normal','Low_DoS','Medium_DoS','High_DoS','Recovery'};
+numEvents = 2000;      % number of SEQUENCES (each is a full time-series)
+T = 20;                % timesteps per sequence
+
+rng(7);
+sequences = cell(numEvents,1);
+seqLabels = zeros(numEvents,1);
+
+fprintf('Generating %d temporal sequences (%d steps each)...\n', numEvents, T);
+for e = 1:numEvents
+    peakIntensity = rand();                       % how severe this event gets
+    label = min(floor(peakIntensity/0.25), 3);     % 0..3 = Normal..High
+    isRecoveryEvent = rand() < 0.20;
+    if isRecoveryEvent, label = 4; end
+
+    seq = zeros(T, 22);   % 20 electrical features + delay + loss
+    for t = 1:T
+        scale = 0.70 + 0.60*rand();
+        [Pspec, Qspec] = scaleLoad(Pspec0, Qspec0, slack, scale);
+        [V, delta, ok] = runNR(G0, B0, Pspec, Qspec, pq, slack, tol, maxIter);
+        if ~ok, V = ones(nbus,1); delta = zeros(nbus,1); end
+        P = calcP(V, delta, G0, B0); Q = calcQ(V, delta, G0, B0);
+
+        frac = t / T;   % progress through the sequence, 0 -> 1
+        if ~isRecoveryEvent
+            % Attack ramps up over the first half, sustains at peak
+            % for the second half (classic DoS shape)
+            rampFrac = min(frac / 0.5, 1);
+            intensity_t = peakIntensity * rampFrac;
+        else
+            % Recovery: starts at a past peak and decays toward zero
+            intensity_t = peakIntensity * (1 - frac);
+        end
+
+        delay_t = intensity_t + 0.05*randn();
+        loss_t  = 0.9*intensity_t + 0.05*randn();
+        delay_t = min(max(delay_t,0),1);
+        loss_t  = min(max(loss_t,0),1);
+
+        Vn = V + 0.003*randn(size(V));
+        dn = delta + deg2rad(0.05)*randn(size(delta));
+        Pn = P + (0.5/baseMVA)*randn(size(P));
+        Qn = Q + (0.3/baseMVA)*randn(size(Q));
+
+        seq(t,:) = [Vn' rad2deg(dn') Pn'*baseMVA Qn'*baseMVA delay_t loss_t];
+    end
+    sequences{e} = seq;
+    seqLabels(e) = label;
+end
+
+seqLabels = categorical(seqLabels, 0:4, classNames);
+save('DoS_timeseries_dataset.mat', 'sequences', 'seqLabels', 'classNames');
+fprintf('Saved DoS_timeseries_dataset.mat (%d sequences x %d timesteps)\n', numEvents, T);
+
+%% ---- Flatten to Excel: one row per (SequenceID, TimeStep) ----
+% Each sequence's T=20 timesteps become T separate rows, all tagged
+% with the same SequenceID and Label so you can group them back
+% together later (e.g. pivot/filter by SequenceID in Excel).
+featNames = {'Bus1_V','Bus2_V','Bus3_V','Bus4_V','Bus5_V', ...
+             'Bus1_Angle','Bus2_Angle','Bus3_Angle','Bus4_Angle','Bus5_Angle', ...
+             'Bus1_P','Bus2_P','Bus3_P','Bus4_P','Bus5_P', ...
+             'Bus1_Q','Bus2_Q','Bus3_Q','Bus4_Q','Bus5_Q', ...
+             'Packet_Delay','Packet_Loss'};
+
+totalRows = numEvents * T;
+flatRows = cell(totalRows,1);
+r = 0;
+for e = 1:numEvents
+    for t = 1:T
+        r = r + 1;
+        rowVals = num2cell(sequences{e}(t,:));
+        flatRows{r} = table(e, t, rowVals{:}, string(seqLabels(e)), double(seqLabels(e))-1, ...
+            'VariableNames', [{'SequenceID','TimeStep'}, featNames, {'Label_Name','Label'}]);
+    end
+end
+Tflat = vertcat(flatRows{:});
+
+outFile = 'DoS_timeseries_dataset.xlsx';
+writetable(Tflat, outFile);
+fprintf('Saved %s (%d rows = %d sequences x %d timesteps, %d columns)\n', ...
+    outFile, height(Tflat), numEvents, T, width(Tflat));
+
+fprintf('\nLabel legend:\n');
+fprintf('  0 = Normal\n  1 = Low_DoS\n  2 = Medium_DoS\n  3 = High_DoS\n  4 = Recovery\n');
+
+
+%% ============ Reused power-flow functions (same as before) ============
+function Ybus = buildYbus(nbus, lineData)
+    Ybus = zeros(nbus,nbus);
+    for k = 1:size(lineData,1)
+        i=lineData(k,1); j=lineData(k,2); r=lineData(k,3); x=lineData(k,4); bH=lineData(k,5);
+        y = 1/(r+1i*x);
+        Ybus(i,i)=Ybus(i,i)+y+1i*bH; Ybus(j,j)=Ybus(j,j)+y+1i*bH;
+        Ybus(i,j)=Ybus(i,j)-y; Ybus(j,i)=Ybus(j,i)-y;
+    end
+end
+function [Pspec,Qspec] = scaleLoad(P0,Q0,slack,scale)
+    Pspec=P0*scale; Qspec=Q0*scale; Pspec(slack)=0; Qspec(slack)=0;
+end
+function P = calcP(V,delta,G,B)
+    n=numel(V); P=zeros(n,1);
+    for i=1:n
+        s=0; for j=1:n, s=s+V(j)*(G(i,j)*cos(delta(i)-delta(j))+B(i,j)*sin(delta(i)-delta(j))); end
+        P(i)=V(i)*s;
+    end
+end
+function Q = calcQ(V,delta,G,B)
+    n=numel(V); Q=zeros(n,1);
+    for i=1:n
+        s=0; for j=1:n, s=s+V(j)*(G(i,j)*sin(delta(i)-delta(j))-B(i,j)*cos(delta(i)-delta(j))); end
+        Q(i)=V(i)*s;
+    end
+end
+function J = buildJacobian(V,delta,G,B,P,Q,pq)
+    npq=numel(pq); J11=zeros(npq); J12=zeros(npq); J21=zeros(npq); J22=zeros(npq);
+    for a=1:npq
+        i=pq(a);
+        for c=1:npq
+            k=pq(c);
+            if i~=k
+                ang=delta(i)-delta(k);
+                J11(a,c)=V(i)*V(k)*(G(i,k)*sin(ang)-B(i,k)*cos(ang));
+                J12(a,c)=V(i)*(G(i,k)*cos(ang)+B(i,k)*sin(ang));
+                J21(a,c)=-V(i)*V(k)*(G(i,k)*cos(ang)+B(i,k)*sin(ang));
+                J22(a,c)=V(i)*(G(i,k)*sin(ang)-B(i,k)*cos(ang));
+            else
+                J11(a,c)=-Q(i)-V(i)^2*B(i,i); J12(a,c)=P(i)/V(i)+V(i)*G(i,i);
+                J21(a,c)=P(i)-V(i)^2*G(i,i);  J22(a,c)=Q(i)/V(i)-V(i)*B(i,i);
+            end
+        end
+    end
+    J=[J11 J12; J21 J22];
+end
+function [V,delta,converged] = runNR(G,B,Pspec,Qspec,pq,slack,tol,maxIter)
+    nbus=size(G,1); V=ones(nbus,1); V(slack)=1.06; delta=zeros(nbus,1);
+    converged=false; npq=numel(pq);
+    for iter=1:maxIter
+        P=calcP(V,delta,G,B); Q=calcQ(V,delta,G,B);
+        mismatch=[Pspec(pq)-P(pq); Qspec(pq)-Q(pq)];
+        if max(abs(mismatch))<tol, converged=true; break; end
+        J=buildJacobian(V,delta,G,B,P,Q,pq); dx=J\mismatch;
+        delta(pq)=delta(pq)+dx(1:npq); V(pq)=V(pq)+dx(npq+1:end);
+    end
+end
