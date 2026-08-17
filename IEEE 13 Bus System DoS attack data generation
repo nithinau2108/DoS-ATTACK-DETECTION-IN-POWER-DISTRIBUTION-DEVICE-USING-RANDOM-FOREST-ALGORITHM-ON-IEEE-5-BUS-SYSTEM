@@ -1,0 +1,30 @@
+clear; clc;
+
+BASE_KV  = 11;
+BASE_MVA = 100;
+Zbase = BASE_KV^2 / BASE_MVA;
+
+tol = 1e-8; maxIter = 100;
+
+busDataRaw = [
+    1     0     0;
+    2   890   468;
+    3   628   470;
+    4  1112   764;
+    5   636   378;
+    6   474   344;
+    7  1342  1078;
+    8   920   292;
+    9   766   498;
+    10  662   480;
+    11  690   186;
+    12 1292   554;
+    13 1124   480];
+
+nbus  = size(busDataRaw,1);
+slack = 1;
+pq    = 2:nbus;
+
+Pspec0 = -busDataRaw(:,2) / (1000*BASE_MVA);   % kW -> pu (negative = load)
+Qspec0 = -busDataRaw(:,3) / (1000*BASE_MVA);   % kVAr -> pu
+Pspec0(slack) = 0; Qspec0(slack) = 0;
