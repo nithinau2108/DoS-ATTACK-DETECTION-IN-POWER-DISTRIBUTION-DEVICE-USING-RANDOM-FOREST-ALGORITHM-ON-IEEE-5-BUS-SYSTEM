@@ -49,3 +49,29 @@ lineData(:,5) = 0;                       % no line charging susceptance given
 
 Ybus0 = buildYbus(nbus, lineData);
 G0 = real(Ybus0); B0 = imag(Ybus0);
+[V0, d0, ok0] = runNR(G0, B0, Pspec0, Qspec0, pq, slack, tol, maxIter);
+if ~ok0
+    error('Base case power flow did not converge - check base kV/MVA assumptions.');
+end
+fprintf('Base case converged. Voltage range: %.4f - %.4f pu\n', min(V0), max(V0));
+numSamples = 10000;
+rng(42);
+results = cell(numSamples,1);
+sampleID = 0; k = 0;
+
+fprintf('Generating %d samples for IEEE 13-bus system...\n', numSamples);
+while k < numSamples
+    scale = 0.70 + 0.60*rand();
+    Pspec = Pspec0 * scale; Pspec(slack) = 0;
+    Qspec = Qspec0 * scale; Qspec(slack) = 0;
+    [V, delta, converged] = runNR(G0, B0, Pspec, Qspec, pq, slack, tol, maxIter);
+    if ~converged
+        continue
+    end
+    P = calcP(V, delta, G0, B0);
+    Q = calcQ(V, delta, G0, B0);
+
+    Vn = V + 0.003*randn(size(V));
+    dn = delta + deg2rad(0.05)*randn(size(delta));
+    Pn = P + (0.5/BASE_MVA)*randn(size(P));
+    Qn = Q + (0.3/BASE_MVA)*randn(size(Q));
