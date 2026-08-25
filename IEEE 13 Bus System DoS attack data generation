@@ -75,3 +75,32 @@ while k < numSamples
     dn = delta + deg2rad(0.05)*randn(size(delta));
     Pn = P + (0.5/BASE_MVA)*randn(size(P));
     Qn = Q + (0.3/BASE_MVA)*randn(size(Q));
+glitchCount = 0;
+    if rand() < 0.04
+        b = randi(nbus);
+        Vn(b) = NaN; dn(b) = NaN; Pn(b) = NaN; Qn(b) = NaN;
+        glitchCount = 1;
+    end
+
+    % ---- Hidden attack-intensity model (drives the label) ----
+    isRecovery = rand() < 0.15;
+    if ~isRecovery
+        intensity = rand();
+        label = min(floor(intensity/0.25), 3);
+        packet_delay = intensity + 0.06*randn();
+        packet_loss  = 0.9*intensity + 0.06*randn();
+        % ~15% low-and-slow DoS: elevated delay/loss but glitchCount stays as-is
+    else
+        recoveryProg = rand();
+        label = 4;
+        packet_delay = 0.30 + 0.40*(1-recoveryProg) + 0.06*randn();
+        packet_loss  = 0.05*(1-recoveryProg)         + 0.03*randn();
+    end
+    packet_delay = min(max(packet_delay,0),1);
+    packet_loss  = min(max(packet_loss,0),1);
+
+    sampleID = sampleID + 1;
+    k = k + 1;
+    results{sampleID} = buildRow(sampleID, label, Vn, dn, Pn, Qn, BASE_MVA, ...
+                                  packet_delay, packet_loss, glitchCount, nbus);
+end
