@@ -104,3 +104,115 @@ glitchCount = 0;
     results{sampleID} = buildRow(sampleID, label, Vn, dn, Pn, Qn, BASE_MVA, ...
                                   packet_delay, packet_loss, glitchCount, nbus);
 end
+results = results(~cellfun(@isempty, results));
+T = vertcat(results{:});
+T = T(randperm(height(T)), :);
+
+classNames = {'Normal','Low_DoS','Medium_DoS','High_DoS','Recovery'};
+Ycheck = categorical(T.Label, [0 1 2 3 4], classNames);
+tab = countcats(Ycheck);
+fprintf('\nClass counts:\n');
+for i = 1:numel(classNames)
+    fprintf('  %-12s : %d\n', classNames{i}, tab(i));
+end
+
+outFile = 'IEEE13Bus_DoS_dataset.xlsx';
+writetable(T, outFile);
+fprintf('\nDataset saved to: %s (%d rows, %d columns)\n', outFile, height(T), width(T));
+
+
+%% =================================================================
+%                         LOCAL FUNCTIONS
+%  =================================================================
+function Ybus = buildYbus(nbus, lineData)
+    Ybus = zeros(nbus, nbus);
+    for k = 1:size(lineData,1)
+        i = lineData(k,1); j = lineData(k,2);
+        r = lineData(k,3); x = lineData(k,4); bHalf = lineData(k,5);
+        y = 1/(r + 1i*x);
+        Ybus(i,i) = Ybus(i,i) + y + 1i*bHalf;
+        Ybus(j,j) = Ybus(j,j) + y + 1i*bHalf;
+        Ybus(i,j) = Ybus(i,j) - y;
+        Ybus(j,i) = Ybus(j,i) - y;
+    end
+end
+function P = calcP(V, delta, G, B)
+    nbus = numel(V); P = zeros(nbus,1);
+    for i = 1:nbus
+        s = 0;
+        for j = 1:nbus
+            s = s + V(j)*(G(i,j)*cos(delta(i)-delta(j)) + B(i,j)*sin(delta(i)-delta(j)));
+        end
+        P(i) = V(i)*s;
+    end
+end
+function Q = calcQ(V, delta, G, B)
+    nbus = numel(V); Q = zeros(nbus,1);
+    for i = 1:nbus
+        s = 0;
+        for j = 1:nbus
+            s = s + V(j)*(G(i,j)*sin(delta(i)-delta(j)) - B(i,j)*cos(delta(i)-delta(j)));
+        end
+        Q(i) = V(i)*s;
+    end
+end
+function J = buildJacobian(V, delta, G, B, P, Q, pq)
+    npq = numel(pq);
+    J11 = zeros(npq,npq); J12 = zeros(npq,npq);
+    J21 = zeros(npq,npq); J22 = zeros(npq,npq);
+    for a = 1:npq
+        i = pq(a);
+        for c = 1:npq
+            kk = pq(c);
+            if i ~= kk
+                ang = delta(i) - delta(kk);
+                J11(a,c) =  V(i)*V(kk)*(G(i,kk)*sin(ang) - B(i,kk)*cos(ang));
+                J12(a,c) =  V(i)*(G(i,kk)*cos(ang) + B(i,kk)*sin(ang));
+                J21(a,c) = -V(i)*V(kk)*(G(i,kk)*cos(ang) + B(i,kk)*sin(ang));
+                J22(a,c) =  V(i)*(G(i,kk)*sin(ang) - B(i,kk)*cos(ang));
+            else
+                J11(a,c) = -Q(i) - V(i)^2*B(i,i);
+                J12(a,c) =  P(i)/V(i) + V(i)*G(i,i);
+                J21(a,c) =  P(i) - V(i)^2*G(i,i);
+                J22(a,c) =  Q(i)/V(i) - V(i)*B(i,i);
+            end
+        end
+    end
+    J = [J11 J12; J21 J22];
+end
+function [V, delta, converged] = runNR(G, B, Pspec, Qspec, pq, slack, tol, maxIter)
+    nbus = size(G,1);
+    V = ones(nbus,1); delta = zeros(nbus,1);
+    converged = false; npq = numel(pq);
+    for iter = 1:maxIter
+        P = calcP(V, delta, G, B);
+        Q = calcQ(V, delta, G, B);
+        mismatch = [Pspec(pq)-P(pq); Qspec(pq)-Q(pq)];
+        if max(abs(mismatch)) < tol
+            converged = true; break
+        end
+        J = buildJacobian(V, delta, G, B, P, Q, pq);
+        dx = J \ mismatch;
+        delta(pq) = delta(pq) + dx(1:npq);
+        V(pq)     = V(pq)     + dx(npq+1:end);
+    end
+end
+function row = buildRow(id, label, V, delta, P, Q, baseMVA, packet_delay, packet_loss, glitchCount, nbus)
+    varNames = {'SampleID','Label'};
+    vals = {id, label};
+    for b = 1:nbus
+        varNames{end+1} = sprintf('Bus%d_V', b); vals{end+1} = V(b); %#ok<AGROW>
+    end
+    for b = 1:nbus
+        varNames{end+1} = sprintf('Bus%d_Angle', b); vals{end+1} = rad2deg(delta(b)); %#ok<AGROW>
+    end
+    for b = 1:nbus
+        varNames{end+1} = sprintf('Bus%d_P', b); vals{end+1} = P(b)*baseMVA; %#ok<AGROW>
+    end
+    for b = 1:nbus
+        varNames{end+1} = sprintf('Bus%d_Q', b); vals{end+1} = Q(b)*baseMVA; %#ok<AGROW>
+    end
+    varNames = [varNames, {'Packet_Delay','Packet_Loss','GlitchCount'}];
+    vals = [vals, {packet_delay, packet_loss, glitchCount}];
+    row = table(vals{:}, 'VariableNames', varNames);
+end
