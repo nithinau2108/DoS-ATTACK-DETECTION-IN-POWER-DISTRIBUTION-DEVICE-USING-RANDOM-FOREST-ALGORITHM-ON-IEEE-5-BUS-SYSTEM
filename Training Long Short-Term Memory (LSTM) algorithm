@@ -1,0 +1,146 @@
+
+
+clear; clc; close all;
+
+
+[file, path] = uigetfile('*.xlsx', 'Select IEEE13Bus_timeseries_dataset.xlsx');
+if isequal(file, 0)
+    error('No dataset selected.');
+end
+Traw = readtable(fullfile(path, file), 'TextType', 'string');
+fprintf('Loaded: %s (%d rows)\n', fullfile(path, file), height(Traw));
+
+classNames = {'Normal','Low_DoS','Medium_DoS','High_DoS','Recovery'};
+numClasses = numel(classNames);
+nbus = 13;
+
+featCols = {};
+for b = 1:nbus, featCols{end+1} = sprintf('Bus%d_V', b); end     %#ok<AGROW>
+for b = 1:nbus, featCols{end+1} = sprintf('Bus%d_Angle', b); end %#ok<AGROW>
+for b = 1:nbus, featCols{end+1} = sprintf('Bus%d_P', b); end     %#ok<AGROW>
+for b = 1:nbus, featCols{end+1} = sprintf('Bus%d_Q', b); end     %#ok<AGROW>
+featCols = [featCols, {'Packet_Delay','Packet_Loss'}];
+
+seqIDs = unique(Traw.SequenceID, 'stable');
+numEvents = numel(seqIDs);
+
+sequences = cell(numEvents,1);
+seqLabels = zeros(numEvents,1);
+for e = 1:numEvents
+    rowsForSeq = Traw(Traw.SequenceID == seqIDs(e), :);
+    rowsForSeq = sortrows(rowsForSeq, 'TimeStep');
+    sequences{e} = rowsForSeq{:, featCols};
+    seqLabels(e) = rowsForSeq.Label(1);
+end
+fprintf('Reconstructed %d sequences (%d timesteps each, %d features) from Excel.\n', ...
+    numEvents, size(sequences{1},1), size(sequences{1},2));
+
+seqLabels = categorical(seqLabels, 0:4, classNames);
+
+%% ---- Scale using stats from ALL timesteps/sequences ----
+allRows = vertcat(sequences{:});
+mu = mean(allRows,1); sigma = std(allRows,0,1); sigma(sigma==0)=1;
+XSeq = cellfun(@(s) ((s-mu)./sigma)', sequences, 'UniformOutput', false);
+Y = seqLabels;
+
+
+rng(42);
+idxTrain=[]; idxVal=[]; idxTest=[];
+for i = 1:numClasses
+    idx = find(Y==classNames{i});
+    idx = idx(randperm(numel(idx)));
+    nTr = round(0.70*numel(idx)); nVa = round(0.15*numel(idx));
+    idxTrain=[idxTrain; idx(1:nTr)]; %#ok<AGROW>
+    idxVal=[idxVal; idx(nTr+1:nTr+nVa)]; %#ok<AGROW>
+    idxTest=[idxTest; idx(nTr+nVa+1:end)]; %#ok<AGROW>
+end
+XTrain = XSeq(idxTrain); YTrain = Y(idxTrain);
+XVal   = XSeq(idxVal);   YVal   = Y(idxVal);
+XTest  = XSeq(idxTest);  YTest  = Y(idxTest);
+fprintf('Train: %d | Val: %d | Test: %d\n', numel(idxTrain), numel(idxVal), numel(idxTest));
+
+numFeatures = size(XSeq{1},1);   % 54 for the 13-bus system
+
+
+layers = [
+    sequenceInputLayer(numFeatures, 'Name','input')
+    lstmLayer(96, 'OutputMode','last', 'Name','lstm1')
+    dropoutLayer(0.3, 'Name','drop1')
+    fullyConnectedLayer(48, 'Name','fc1')
+    reluLayer('Name','relu1')
+    fullyConnectedLayer(numClasses, 'Name','fc2')
+    softmaxLayer('Name','softmax')
+    classificationLayer('Name','output')
+];
+
+options = trainingOptions('adam', ...
+    'InitialLearnRate', 1e-3, ...
+    'MaxEpochs', 60, ...
+    'MiniBatchSize', 32, ...
+    'Shuffle', 'every-epoch', ...
+    'ValidationData', {XVal, YVal}, ...
+    'ValidationFrequency', 20, ...
+    'ValidationPatience', 10, ...
+    'Verbose', true, ...
+    'Plots', 'training-progress');
+
+net = trainNetwork(XTrain, YTrain, layers, options);
+
+
+YPred = classify(net, XTest);
+acc = mean(YPred == YTest);
+fprintf('\n=== TEST ACCURACY (IEEE 13-Bus LSTM, temporal): %.2f%% ===\n', acc*100);
+
+figure; cm = confusionchart(YTest, YPred);
+cm.Title = sprintf('IEEE 13-Bus Temporal Confusion Matrix (Acc = %.2f%%)', acc*100);
+
+
+figure('Position',[100 100 1400 800]);
+for c = 1:numel(classNames)
+    idx = find(seqLabels == classNames{c}, 1);   % first example of this class
+    seq = sequences{idx};
+    Tlen = size(seq,1);
+    delayCol = size(seq,2) - 1;
+    lossCol  = size(seq,2);
+
+    subplot(2, ceil(numel(classNames)/2), c);
+    plot(1:Tlen, seq(:,delayCol), 'LineWidth', 2); hold on;
+    plot(1:Tlen, seq(:,lossCol), 'LineWidth', 2);
+    ylim([0 1]);
+    title(classNames{c});
+    xlabel('Timestep'); ylabel('Value (0-1)');
+    legend('Packet Delay','Packet Loss', 'Location','best');
+    grid on;
+end
+sgtitle('Time-Lapse: Network Feature Evolution per Event Class');
+
+
+targetClass = 'Medium_DoS';
+idxAnim = find(seqLabels == targetClass, 1);
+seqAnim = sequences{idxAnim};
+Vcols = 1:nbus;
+
+gifFile = sprintf('timelapse_%s.gif', targetClass);
+figAnim = figure('Position',[100 100 700 500]);
+for t = 1:size(seqAnim,1)
+    bar(1:nbus, seqAnim(t, Vcols));
+    ylim([min(seqAnim(:,Vcols),[],'all')-0.02, max(seqAnim(:,Vcols),[],'all')+0.02]);
+    xlabel('Bus Number'); ylabel('Voltage (p.u.)');
+    title(sprintf('%s - Voltage Profile (Timestep %d/%d)', ...
+        strrep(targetClass,'_',' '), t, size(seqAnim,1)));
+    grid on;
+    drawnow;
+
+    frame = getframe(figAnim);
+    im = frame2im(frame);
+    [imind, cmap] = rgb2ind(im, 256);
+    if t == 1
+        imwrite(imind, cmap, gifFile, 'gif', 'Loopcount', inf, 'DelayTime', 0.3);
+    else
+        imwrite(imind, cmap, gifFile, 'gif', 'WriteMode', 'append', 'DelayTime', 0.3);
+    end
+end
+fprintf('Animated GIF saved: %s\n', gifFile);
+
+save('IEEE13Bus_LSTM_TrainedModel.mat', 'net', 'acc', 'mu', 'sigma', 'classNames');
+fprintf('Saved IEEE13Bus_LSTM_TrainedModel.mat\n');
